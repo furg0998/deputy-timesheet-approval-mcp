@@ -33,6 +33,19 @@ else
 fi
 
 # --- Trust policy ---
+# GitHub repos can enable an "immutable" OIDC subject which embeds numeric
+# IDs (repo:owner@ID/name@ID:...). Detect it via `gh api` when available;
+# override with GITHUB_SUB_PREFIX if needed.
+SUB_PREFIX="${GITHUB_SUB_PREFIX:-repo:${GITHUB_REPO}}"
+if command -v gh >/dev/null 2>&1 && [ -z "${GITHUB_SUB_PREFIX:-}" ]; then
+  DETECTED=$(gh api "repos/${GITHUB_REPO}/actions/oidc/customization/sub" \
+    --jq '.sub_claim_prefix // empty' 2>/dev/null || true)
+  if [ -n "$DETECTED" ]; then
+    SUB_PREFIX="$DETECTED"
+    echo "Detected immutable OIDC subject prefix: $SUB_PREFIX"
+  fi
+fi
+
 TRUST=$(cat <<EOF
 {
   "Version": "2012-10-17",
@@ -43,7 +56,7 @@ TRUST=$(cat <<EOF
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
         "StringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com"},
-        "StringLike": {"token.actions.githubusercontent.com:sub": "repo:${GITHUB_REPO}:*"}
+        "StringLike": {"token.actions.githubusercontent.com:sub": "${SUB_PREFIX}:*"}
       }
     }
   ]
@@ -72,6 +85,17 @@ POLICY=$(cat <<EOF
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "UnscopedReads",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetRandomPassword",
+        "logs:DescribeLogGroups",
+        "cloudformation:ValidateTemplate",
+        "cloudformation:GetTemplateSummary"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "CloudFormation",
       "Effect": "Allow",
       "Action": [
@@ -82,8 +106,6 @@ POLICY=$(cat <<EOF
         "cloudformation:DescribeStackEvents",
         "cloudformation:DescribeStackResources",
         "cloudformation:GetTemplate",
-        "cloudformation:GetTemplateSummary",
-        "cloudformation:ValidateTemplate",
         "cloudformation:CreateChangeSet",
         "cloudformation:ExecuteChangeSet",
         "cloudformation:DeleteChangeSet",
@@ -145,6 +167,8 @@ POLICY=$(cat <<EOF
         "iam:PutRolePolicy",
         "iam:DeleteRolePolicy",
         "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
         "iam:PassRole"
       ],
       "Resource": [

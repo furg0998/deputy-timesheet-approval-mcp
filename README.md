@@ -49,6 +49,11 @@ so the agent learns which approvals look unusual over time.
 ARTIFACT_BUCKET=<bucket> ./scripts/setup-github-oidc.sh
 ```
 
+The OIDC script auto-detects GitHub's *immutable OIDC subject* setting via
+`gh api` (sub becomes `repo:owner@ID/name@ID:...`). If `gh` isn't
+available and your repo has it enabled, pass the prefix manually:
+`GITHUB_SUB_PREFIX=repo:owner@ID/name@ID`.
+
 Then in GitHub repo settings:
 
 - Variables: `AWS_DEPLOY_ROLE_ARN`, `AWS_REGION`, `ARTIFACT_BUCKET`

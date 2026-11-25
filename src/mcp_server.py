@@ -386,6 +386,32 @@ async def check_connection() -> dict:
     }
 
 
+class _IdempotentLifespan:
+    """Mangum runs ASGI lifespan startup/shutdown on every invocation, but
+    StreamableHTTPSessionManager.run() can only be entered once. Start the
+    manager on the first startup and just ack the rest."""
+
+    def __init__(self, app, session_manager):
+        self.app = app
+        self.manager = session_manager
+        self._started = False
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "lifespan":
+            return await self.app(scope, receive, send)
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                if not self._started:
+                    self._started = True
+                    self._cm = self.manager.run()
+                    await self._cm.__aenter__()
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+
 def build_app():
     mcp.custom_route("/.well-known/oauth-authorization-server", ["GET"])(
         auth.authorization_server_metadata
@@ -413,4 +439,4 @@ def build_app():
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    return app
+    return _IdempotentLifespan(app, mcp.session_manager)
