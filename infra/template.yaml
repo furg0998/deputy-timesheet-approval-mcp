@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Deputy timesheet approval MCP server - serverless (Lambda + API Gateway
+  HTTP API + DynamoDB + Secrets Manager).
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket containing the deployment zip.
+  ArtifactKey:
+    Type: String
+    Description: S3 key of the deployment zip.
+  DeputyClientId:
+    Type: String
+    Description: Deputy OAuth client id.
+  DeputyClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Deputy OAuth client secret.
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: deputy-mcp
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  DeputyCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: deputy-mcp/credentials
+      Description: Deputy OAuth client credentials for the MCP server.
+      SecretString: !Sub >-
+        {"client_id": "${DeputyClientId}", "client_secret": "${DeputyClientSecret}"}
+
+  SigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: deputy-mcp/signing-key
+      Description: HMAC key used to sign MCP access tokens.
+      GenerateSecretString:
+        SecretStringTemplate: '{"key": ""}'
+        GenerateStringKey: key
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: deputy-mcp-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: deputy-mcp-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt Table.Arn
+                  - !Sub "${Table.Arn}/index/*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DeputyCredentialsSecret
+                  - !Ref SigningSecret
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: deputy-mcp
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.handler
+      MemorySize: 512
+      Timeout: 30
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          DEPUTY_CREDENTIALS_SECRET_ARN: !Ref DeputyCredentialsSecret
+          SIGNING_SECRET_ARN: !Ref SigningSecret
+          ISSUER_URL: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/deputy-mcp
+      RetentionInDays: 30
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: deputy-mcp
+      ProtocolType: HTTP
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Function.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub "integrations/${Integration}"
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  McpUrl:
+    Description: MCP endpoint URL to give your MCP client.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp"
+  TableName:
+    Value: !Ref Table
