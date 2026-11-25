@@ -243,7 +243,10 @@ async def get_timesheet_detail(timesheet_id: int) -> dict:
     if not ts:
         raise deputy.DeputyError(f"Timesheet {timesheet_id} not found")
     summary = await client.range_summary(timesheet_id)
-    questions = await client.timesheet_questions(timesheet_id, ts)
+    try:
+        questions = await client.timesheet_questions(timesheet_id, ts)
+    except deputy.DeputyError as e:
+        questions = {"error": str(e)}
     return {
         "timesheet": ts,
         "range_summary": summary,
