@@ -1,4 +1,5 @@
 import time
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -29,6 +30,25 @@ def _get(pk: str, sk: str) -> dict | None:
 
 def _delete(pk: str, sk: str) -> None:
     _t().delete_item(Key={"pk": pk, "sk": sk})
+
+
+_INTERNAL_KEYS = {"pk", "sk", "ttl"}
+
+
+def _plain(value: Any) -> Any:
+    """Convert DynamoDB Decimals to int/float, recursively."""
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    return value
+
+
+def _public(item: dict) -> dict:
+    """Strip storage keys and normalise numbers for tool output."""
+    return {k: _plain(v) for k, v in item.items() if k not in _INTERNAL_KEYS}
 
 
 def _query(pk: str, sk_prefix: str, limit: int = 50, descending: bool = True):
@@ -72,7 +92,9 @@ def update_user_tokens(
 
 def get_employee_profile(user_id: str, employee_id: int) -> dict:
     item = _get(f"USER#{user_id}", f"EMP#{employee_id}")
-    return item or {
+    if item:
+        return _public(item)
+    return {
         "employee_id": employee_id,
         "notes": [],
         "flags": [],
@@ -91,7 +113,7 @@ def get_employee_profiles(user_id: str, employee_ids: list[int]) -> dict[int, di
     )
     out = {}
     for item in resp.get("Responses", {}).get(config.TABLE_NAME, []):
-        out[int(item["employee_id"])] = item
+        out[int(item["employee_id"])] = _public(item)
     return out
 
 
@@ -197,7 +219,7 @@ def get_approval_history(
     user_id: str, employee_id: int | None = None, limit: int = 50
 ) -> list[dict]:
     prefix = f"HIST#{employee_id}#" if employee_id is not None else "HIST#"
-    return _query(f"USER#{user_id}", prefix, limit=limit)
+    return [_public(i) for i in _query(f"USER#{user_id}", prefix, limit=limit)]
 
 
 # --- OAuth flow state (short-lived) ---

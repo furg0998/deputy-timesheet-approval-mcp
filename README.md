@@ -24,18 +24,30 @@ so the agent learns which approvals look unusual over time.
 
 ## Tools
 
+> **Live payroll warning:** the server talks to a real Deputy account. The
+> approve / unapprove / discard / reinstate / comment tools are
+> *transactional* - they change live timesheets and pay. Do not call them to
+> test or explore; ask the account owner first and only run them on a
+> timesheet they name. Their tool descriptions start with `TRANSACTIONAL`
+> and carry the MCP `destructiveHint` annotation so clients can prompt for
+> confirmation. Everything else is read-only against Deputy (notes and flags
+> only touch this server's DynamoDB table).
+
+Dates are interpreted in the business's local time zone, set by the
+`DEPUTY_TIMEZONE` Lambda environment variable (default `Australia/Sydney`).
+
 | Tool | Purpose |
 | --- | --- |
 | `get_approval_queue` | Pending timesheets grouped by employee, with history/flags/anomalies |
 | `list_timesheets` | Raw timesheet query by date range / employee / approval state |
 | `get_timesheet_detail` | Timesheet + pay-range summary + required questions |
 | `suggest_rounding` | Deputy's rounding suggestion |
-| `approve_timesheet` | Approve time + pay (optional overrides/question answers) |
-| `approve_time_only` | Approve time only |
-| `batch_approve` | Approve many at once |
-| `unapprove_timesheet` / `unapprove_pay` | Reverse approval |
-| `discard_timesheet` / `reinstate_timesheet` | Discard / restore |
-| `add_timesheet_comment` | Attach a comment |
+| `approve_timesheet` | **Transactional.** Approve time + pay (optional overrides/question answers) |
+| `approve_time_only` | **Transactional.** Approve time only |
+| `batch_approve` | **Transactional.** Approve many at once |
+| `unapprove_timesheet` / `unapprove_pay` | **Transactional.** Reverse approval |
+| `discard_timesheet` / `reinstate_timesheet` | **Transactional.** Discard / restore |
+| `add_timesheet_comment` | **Transactional.** Attach a comment |
 | `save_employee_note` / `flag_employee` / `clear_employee_flags` | Augmentation layer |
 | `get_employee_profile` / `get_approval_history` | Read the memory layer |
 | `check_connection` | Verify Deputy auth + permissions |
