@@ -9,6 +9,7 @@ DEPUTY_CREDENTIALS_SECRET_ARN = os.environ.get("DEPUTY_CREDENTIALS_SECRET_ARN", 
 SIGNING_SECRET_ARN = os.environ.get("SIGNING_SECRET_ARN", "")
 ISSUER_URL = os.environ.get("ISSUER_URL", "http://localhost:8000")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+DEPUTY_TIMEZONE = os.environ.get("DEPUTY_TIMEZONE", "Australia/Sydney")
 
 DEPUTY_AUTHORIZE_URL = "https://once.deputy.com/my/oauth/login"
 DEPUTY_TOKEN_URL = "https://once.deputy.com/my/oauth/access_token"

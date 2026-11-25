@@ -114,6 +114,7 @@ Resources:
           DEPUTY_CREDENTIALS_SECRET_ARN: !Ref DeputyCredentialsSecret
           SIGNING_SECRET_ARN: !Ref SigningSecret
           ISSUER_URL: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+          DEPUTY_TIMEZONE: Australia/Sydney
 
   LogGroup:
     Type: AWS::Logs::LogGroup

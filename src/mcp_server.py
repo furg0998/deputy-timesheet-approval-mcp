@@ -1,7 +1,10 @@
-from datetime import date, datetime, timedelta, timezone
+import inspect
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
@@ -17,7 +20,11 @@ mcp = FastMCP(
         "see pending timesheets enriched with per-employee history, flags "
         "and notes from previous approval sessions. Approve, discard or "
         "unapprove with the write tools - every action is recorded so "
-        "future sessions can spot unusual patterns."
+        "future sessions can spot unusual patterns. WARNING: this server is "
+        "connected to a live Deputy account. Tools marked TRANSACTIONAL "
+        "change real timesheets and payroll; never call them to test or "
+        "explore, and only call them after the user has explicitly asked "
+        "for that specific action."
     ),
     stateless_http=True,
     json_response=True,
@@ -39,10 +46,36 @@ def _client() -> deputy.DeputyClient:
     return deputy.DeputyClient(_user())
 
 
-def _to_unix(d: str) -> int:
-    return int(
-        datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
-    )
+_TRANSACTIONAL = (
+    "TRANSACTIONAL: changes live Deputy payroll data. Do not call to test "
+    "or explore; only call after the user explicitly asks for this action."
+)
+
+
+def _transactional_tool():
+    def register(fn):
+        return mcp.tool(
+            description=f"{_TRANSACTIONAL}\n\n{inspect.cleandoc(fn.__doc__)}",
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=True
+            ),
+        )(fn)
+
+    return register
+
+
+def _tz() -> ZoneInfo:
+    return ZoneInfo(config.DEPUTY_TIMEZONE)
+
+
+def _today() -> date:
+    return datetime.now(_tz()).date()
+
+
+def _to_unix(d: str, days: int = 0) -> int:
+    """Unix time of local midnight at the start of date d (+ days)."""
+    day = datetime.strptime(d, "%Y-%m-%d").date() + timedelta(days=days)
+    return int(datetime.combine(day, datetime.min.time(), _tz()).timestamp())
 
 
 def _emp_name(ts: dict) -> str | None:
@@ -65,9 +98,6 @@ def _anomalies(emp_id: int, timesheets: list[dict], profile: dict,
     if profile.get("watch") or profile.get("flags"):
         for f in profile.get("flags", [])[-3:]:
             out.append(f"flagged: {f.get('reason')} ({f.get('type')})")
-    if not history:
-        out.append("no prior approval history recorded")
-        return out
     past_hours = [
         float(h["total_time"]) for h in history if h.get("total_time")
     ]
@@ -100,24 +130,30 @@ async def get_approval_queue(
     the previous 14 days ending today. Start here for weekly approvals."""
     user = _user()
     client = _client()
-    end = date.today()
+    end = _today()
     start = end - timedelta(days=14)
     df = date_from or start.isoformat()
     dt = date_to or end.isoformat()
 
-    grouping = await client.employees_for_status_grouping(df, dt, limit=200)
-    employee_ids = (grouping.get("data") or {}).get("employeeIds", [])
-
     timesheets = await client.query_timesheets(
-        _to_unix(df), _to_unix(dt) + 86400, time_approved=False,
+        _to_unix(df), _to_unix(dt, days=1), time_approved=False,
         discarded=False,
     )
 
     by_emp: dict[int, list[dict]] = {}
     for ts in timesheets:
         by_emp.setdefault(int(ts["Employee"]), []).append(ts)
-    all_ids = sorted(set(employee_ids) | set(by_emp))
+    all_ids = sorted(by_emp)
     profiles = store.get_employee_profiles(user["user_id"], all_ids)
+    names = {
+        emp_id: next((n for n in map(_emp_name, sheets) if n), None)
+        or profiles.get(emp_id, {}).get("employee_name")
+        for emp_id, sheets in by_emp.items()
+    }
+    missing = [e for e, n in names.items() if not n]
+    if missing:
+        for emp in await client.query_employees(missing):
+            names[int(emp["Id"])] = emp.get("DisplayName")
 
     queue = []
     for emp_id in all_ids:
@@ -126,14 +162,10 @@ async def get_approval_queue(
         history = store.get_approval_history(
             user["user_id"], emp_id, limit=30
         )
-        name = next(
-            (n for n in (_emp_name(t) for t in sheets) if n),
-            profile.get("employee_name"),
-        )
         queue.append(
             {
                 "employee_id": emp_id,
-                "employee_name": name,
+                "employee_name": names.get(emp_id),
                 "watch": profile.get("watch", False),
                 "flags": profile.get("flags", []),
                 "notes": profile.get("notes", []),
@@ -178,7 +210,7 @@ async def list_timesheets(
     client = _client()
     sheets = await client.query_timesheets(
         _to_unix(date_from),
-        _to_unix(date_to) + 86400,
+        _to_unix(date_to, days=1),
         employee_id=employee_id,
         time_approved=approved,
         discarded=False,
@@ -207,11 +239,11 @@ async def get_timesheet_detail(timesheet_id: int) -> dict:
     """Full detail for one timesheet: pay-range summary plus any
     timesheet questions and answers Deputy requires before approval."""
     client = _client()
-    ts, summary, questions = (
-        await client.get_timesheet(timesheet_id),
-        await client.range_summary(timesheet_id),
-        await client.timesheet_questions(timesheet_id),
-    )
+    ts = await client.get_timesheet(timesheet_id)
+    if not ts:
+        raise deputy.DeputyError(f"Timesheet {timesheet_id} not found")
+    summary = await client.range_summary(timesheet_id)
+    questions = await client.timesheet_questions(timesheet_id, ts)
     return {
         "timesheet": ts,
         "range_summary": summary,
@@ -221,11 +253,12 @@ async def get_timesheet_detail(timesheet_id: int) -> dict:
 
 @mcp.tool()
 async def suggest_rounding(timesheet_id: int) -> dict:
-    """Get Deputy's suggested rounding for a timesheet before approving."""
+    """Get Deputy's suggested rounding for a timesheet before approving.
+    Read-only: does not change the timesheet."""
     return await _client().suggest_rounding(timesheet_id)
 
 
-@mcp.tool()
+@_transactional_tool()
 async def approve_timesheet(
     timesheet_id: int,
     set_properties: dict | None = None,
@@ -238,24 +271,27 @@ async def approve_timesheet(
     client = _client()
     ts = await client.get_timesheet(timesheet_id)
     result = await client.approve(
-        timesheet_id, set_properties=set_properties, set_answers=set_answers
+        timesheet_id,
+        set_properties=set_properties,
+        set_answers=set_answers,
+        timesheet=ts,
     )
     await _record(user, timesheet_id, "approve", ts)
     return {"result": result, "recorded": True}
 
 
-@mcp.tool()
+@_transactional_tool()
 async def approve_time_only(timesheet_id: int) -> dict:
     """Approve only the time component of a timesheet (not pay)."""
     user = _user()
     client = _client()
     ts = await client.get_timesheet(timesheet_id)
-    result = await client.approve_time(timesheet_id)
+    result = await client.approve_time(timesheet_id, ts)
     await _record(user, timesheet_id, "approve-time", ts)
     return {"result": result, "recorded": True}
 
 
-@mcp.tool()
+@_transactional_tool()
 async def batch_approve(timesheet_ids: list[int]) -> dict:
     """Approve multiple timesheets (time and pay) in one call. Use for the
     clean part of the weekly queue after anomalies are reviewed."""
@@ -268,7 +304,7 @@ async def batch_approve(timesheet_ids: list[int]) -> dict:
     return {"result": result, "recorded": len(timesheet_ids)}
 
 
-@mcp.tool()
+@_transactional_tool()
 async def unapprove_timesheet(timesheet_id: int) -> dict:
     """Unapprove a timesheet (both time and pay components)."""
     user = _user()
@@ -279,7 +315,7 @@ async def unapprove_timesheet(timesheet_id: int) -> dict:
     return {"result": result, "recorded": True}
 
 
-@mcp.tool()
+@_transactional_tool()
 async def unapprove_pay(timesheet_id: int) -> dict:
     """Unapprove only the pay component, leaving time approved."""
     user = _user()
@@ -290,7 +326,7 @@ async def unapprove_pay(timesheet_id: int) -> dict:
     return {"result": result, "recorded": True}
 
 
-@mcp.tool()
+@_transactional_tool()
 async def discard_timesheet(timesheet_id: int) -> dict:
     """Discard a timesheet (e.g. a duplicate or erroneous record)."""
     user = _user()
@@ -301,7 +337,7 @@ async def discard_timesheet(timesheet_id: int) -> dict:
     return {"result": result, "recorded": True}
 
 
-@mcp.tool()
+@_transactional_tool()
 async def reinstate_timesheet(timesheet_id: int) -> dict:
     """Reinstate a previously discarded timesheet."""
     user = _user()
@@ -312,7 +348,7 @@ async def reinstate_timesheet(timesheet_id: int) -> dict:
     return {"result": result, "recorded": True}
 
 
-@mcp.tool()
+@_transactional_tool()
 async def add_timesheet_comment(timesheet_id: int, content: str) -> dict:
     """Add a comment to a timesheet - useful for recording why a timesheet
     was or was not approved."""

@@ -68,6 +68,18 @@ def _auth_headers(access_token: str) -> dict:
     }
 
 
+def _timesheet_properties(ts: dict) -> dict:
+    """TSA v2 property fields from a v1 Timesheet record (int64 as str)."""
+    props: dict[str, Any] = {}
+    if ts.get("StartTime"):
+        props["startTime"] = str(int(ts["StartTime"]))
+    if ts.get("EndTime"):
+        props["endTime"] = str(int(ts["EndTime"]))
+    if ts.get("OperationalUnit"):
+        props["operationalUnitId"] = int(ts["OperationalUnit"])
+    return props
+
+
 class DeputyClient:
     """Per-user Deputy API client bound to their install endpoint."""
 
@@ -216,18 +228,27 @@ class DeputyClient:
             f"/api/tsa/v2/timesheets/{timesheet_id}:applicable-range-summary",
         )
 
-    async def timesheet_questions(self, timesheet_id: int) -> dict:
+    async def timesheet_questions(
+        self, timesheet_id: int, timesheet: dict | None = None
+    ) -> dict:
+        ts = timesheet or await self.get_timesheet(timesheet_id)
+        body = await self._current_properties_body(timesheet_id, ts)
+        if ts.get("Employee"):
+            body["setProperties"]["employeeId"] = int(ts["Employee"])
         return await self._request(
             "POST",
             f"/api/tsa/v2/timesheets/{timesheet_id}:get-timesheet-questions",
-            {},
+            body,
         )
 
-    async def suggest_rounding(self, timesheet_id: int) -> dict:
+    async def suggest_rounding(
+        self, timesheet_id: int, timesheet: dict | None = None
+    ) -> dict:
+        body = await self._current_properties_body(timesheet_id, timesheet)
         return await self._request(
             "POST",
             f"/api/tsa/v2/timesheets/{timesheet_id}:suggest-rounding",
-            {},
+            body["setProperties"],
         )
 
     async def approve(
@@ -236,6 +257,7 @@ class DeputyClient:
         set_properties: dict | None = None,
         set_answers: dict | None = None,
         set_pay_returns: dict | None = None,
+        timesheet: dict | None = None,
     ) -> dict:
         body: dict[str, Any] = {}
         if set_properties:
@@ -244,42 +266,56 @@ class DeputyClient:
             body["setAnswers"] = set_answers
         if set_pay_returns:
             body["setPayReturns"] = set_pay_returns
+        if not body:
+            body = await self._current_properties_body(timesheet_id, timesheet)
         return await self._request(
             "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:approve", body
         )
 
-    async def approve_time(self, timesheet_id: int) -> dict:
+    async def approve_time(
+        self, timesheet_id: int, timesheet: dict | None = None
+    ) -> dict:
         return await self._request(
             "POST",
             f"/api/tsa/v2/timesheets/{timesheet_id}:approve-time",
-            {},
+            await self._current_properties_body(timesheet_id, timesheet),
         )
+
+    async def _current_properties_body(
+        self, timesheet_id: int, timesheet: dict | None
+    ) -> dict:
+        # Deputy rejects an empty JSON object with "invalid format", so echo
+        # the timesheet's current properties (no effective override).
+        ts = timesheet or await self.get_timesheet(timesheet_id)
+        if not ts:
+            raise DeputyError(f"Timesheet {timesheet_id} not found")
+        return {"setProperties": _timesheet_properties(ts)}
+
+    # These endpoints take no request body.
 
     async def unapprove(self, timesheet_id: int) -> dict:
         return await self._request(
-            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:unapprove", {}
+            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:unapprove"
         )
 
     async def unapprove_pay(self, timesheet_id: int) -> dict:
         return await self._request(
-            "POST",
-            f"/api/tsa/v2/timesheets/{timesheet_id}:unapprove-pay",
-            {},
+            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:unapprove-pay"
         )
 
     async def reapprove(self, timesheet_id: int) -> dict:
         return await self._request(
-            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:reapprove", {}
+            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:reapprove"
         )
 
     async def discard(self, timesheet_id: int) -> dict:
         return await self._request(
-            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:discard", {}
+            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:discard"
         )
 
     async def reinstate(self, timesheet_id: int) -> dict:
         return await self._request(
-            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:reinstate", {}
+            "POST", f"/api/tsa/v2/timesheets/{timesheet_id}:reinstate"
         )
 
     async def batch(self, action: str, timesheet_ids: list[int]) -> dict:
