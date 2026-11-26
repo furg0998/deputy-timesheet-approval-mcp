@@ -143,3 +143,67 @@ def test_per_user_isolation_and_rules(env):
     assert run(sc.delete_rule("long-shifts")) == {"deleted": True}
     assert run(sc.delete_shortcut("s")) == {"deleted": True}
     assert run(sc.list_shortcuts()) == []
+
+
+def test_filter_join_foreach_value(env):
+    mcp, sc, calls, _ = env
+
+    @mcp.tool()
+    async def list_employees() -> list[dict]:
+        return [{"Id": 1, "Name": "Ann"}, {"Id": 2, "Name": "Bob"}]
+
+    run(sc.save_shortcut(
+        "long-shift-report", "Join long shifts with names and flag them",
+        params={"min_hours": "threshold"},
+        steps=[
+            {"id": "q", "tool": "get_queue", "args": {"date_from": "x"}},
+            {"id": "long", "op": "filter", "input": "{{steps.q.queue}}",
+             "where": [{"field": "hours", "op": ">", "value": "{{params.min_hours}}"}],
+             "sort_by": "hours", "descending": True},
+            {"id": "emps", "tool": "list_employees"},
+            {"id": "named", "op": "join", "left": "{{steps.long}}",
+             "right": "{{steps.emps}}", "on": {"left": "employee_id", "right": "Id"},
+             "as": "employee", "how": "inner"},
+            {"id": "rows", "op": "pick", "input": "{{steps.named}}",
+             "fields": {"name": "employee.Name", "hours": "hours"}},
+            {"id": "flags", "tool": "flag", "foreach": "{{steps.named}}",
+             "args": {"employee_ids": ["{{item.employee_id}}"],
+                      "reason": "{{item.employee.Name}} worked {{item.hours}}h"}},
+            {"op": "value", "value": {"long_shifts": "{{steps.rows}}",
+                                      "flagged": "{{steps.flags.*.flagged}}",
+                                      "queue_size": "{{steps.q.queue.*.employee_id}}"}},
+        ],
+    ))
+    out = run(sc.run_shortcut("long-shift-report", {"min_hours": 10}))
+    assert out["ran"], out
+    assert out["result"] == {"long_shifts": [{"name": "Bob", "hours": 11.0}],
+                             "flagged": [[2]], "queue_size": [1, 2]}
+    assert calls[-1] == ("flag", [2], "Bob worked 11.0h")
+
+
+@pytest.mark.parametrize("step,err", [
+    ({"op": "nope", "input": []}, "unknown op"),
+    ({"op": "join", "left": []}, "needs right, on"),
+    ({"tool": "get_queue", "op": "filter"}, "either a 'tool' or an 'op'"),
+    ({"tool": "get_queue", "args": {"date_from": "{{item.x}}"}}, "foreach"),
+])
+def test_op_validation(env, step, err):
+    _, sc, _, _ = env
+    with pytest.raises(shortcuts.ShortcutError, match=err):
+        run(sc.save_shortcut("bad", "d", steps=[step]))
+
+
+def test_foreach_destructive_needs_confirm_and_limit(env):
+    _, sc, calls, _ = env
+    run(sc.save_shortcut("each", "d", steps=[
+        {"id": "q", "tool": "get_queue", "args": {"date_from": "x"}},
+        {"tool": "approve", "foreach": "{{steps.q.queue}}",
+         "args": {"ids": ["{{item.employee_id}}"]}},
+    ]))
+    assert run(sc.run_shortcut("each"))["requires_confirm"]
+    assert run(sc.run_shortcut("each", confirm=True))["result"] == [
+        {"approved": [1]}, {"approved": [2]}]
+    run(sc.save_shortcut("big", "d", params={"xs": ""}, steps=[
+        {"tool": "get_queue", "foreach": "{{params.xs}}", "args": {"date_from": "x"}}]))
+    out = run(sc.run_shortcut("big", {"xs": list(range(101))}))
+    assert not out["ran"] and "limit" in out["steps"][0]["error"]

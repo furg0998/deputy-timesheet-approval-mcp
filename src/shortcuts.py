@@ -1,20 +1,33 @@
 """Per-user shortcuts and rules for any FastMCP server.
 
-A shortcut is a saved sequence of calls to the server's own tools that an AI
-can replay with a single `run_shortcut` call. A rule is a standing
-instruction the user wants every AI session to follow. Both are stored per
-user through a small storage interface, so this module has no dependency on
-the host server and can be reused by other MCP servers.
+A shortcut is a saved sequence of steps that an AI can replay with a single
+`run_shortcut` call. A rule is a standing instruction the user wants every
+AI session to follow. Both are stored per user through a small storage
+interface, so this module has no dependency on the host server and can be
+reused by other MCP servers.
 
-Step arguments may contain `{{...}}` references:
+Each step either calls one of the server's tools:
+  {"id": "queue", "tool": "get_approval_queue", "args": {...}}
+  {"tool": "flag_employee", "foreach": "{{steps.long.*}}",
+   "args": {"employee_id": "{{item.employee_id}}", ...}}   # once per item
+or transforms earlier results in-process (no tool call):
+  {"op": "filter", "input": ..., "where": [{"field", "op", "value"}],
+   "sort_by": ..., "descending": bool, "limit": n}
+  {"op": "pick", "input": ..., "fields": ["a", "b.c"] | {"new": "path"}}
+  {"op": "join", "left": ..., "right": ..., "on": "key" |
+   {"left": path, "right": path}, "as": "joined", "how": "left"|"inner",
+   "many": bool}
+  {"op": "value", "value": ...}   # build an object from earlier results
+
+Any value may contain `{{...}}` references:
   {{params.<name>}}             a parameter passed to run_shortcut
-  {{steps.<id|index>.<path>}}   output of an earlier step; path segments are
-                                dict keys, list indexes, or `*` to map over
-                                a list
-A value that is exactly one reference keeps its type (list, int, ...);
-references inside longer strings are interpolated as text.
+  {{steps.<id|index>.<path>}}   output of an earlier step
+  {{item.<path>}}               current item, inside a foreach step's args
+Path segments are dict keys, list indexes, or `*` to map over a list. A value
+that is exactly one reference keeps its type (list, int, ...); references
+inside longer strings are interpolated as text.
 """
-
+import operator
 import re
 import time
 import uuid
@@ -30,6 +43,7 @@ INSTRUCTIONS = (
 )
 
 MAX_STEPS = 20
+MAX_FOREACH = 100
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _REF_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _SELF_TOOLS = {
@@ -95,33 +109,161 @@ def _walk(value: Any, path: list[str]) -> Any:
     return value
 
 
-def _resolve_ref(ref: str, params: dict, outputs: dict) -> Any:
+def _resolve_ref(ref: str, scopes: dict) -> Any:
     head, *path = ref.split(".")
     if head == "params" and path:
-        if path[0] not in params:
+        if path[0] not in scopes["params"]:
             raise ShortcutError(f"missing parameter '{path[0]}'")
-        return _walk(params[path[0]], path[1:])
+        return _walk(scopes["params"][path[0]], path[1:])
     if head == "steps" and path:
-        if path[0] not in outputs:
+        if path[0] not in scopes["steps"]:
             raise ShortcutError(f"unknown step '{path[0]}'")
-        return _walk(outputs[path[0]], path[1:])
+        return _walk(scopes["steps"][path[0]], path[1:])
+    if head == "item" and "item" in scopes:
+        return _walk(scopes["item"], path)
     raise ShortcutError(f"invalid reference '{{{{{ref}}}}}'")
 
 
-def render(value: Any, params: dict, outputs: dict) -> Any:
-    """Substitute {{...}} references in step arguments."""
+def render(value: Any, scopes: dict) -> Any:
+    """Substitute {{...}} references. scopes holds params, steps and,
+    inside a foreach, item."""
     if isinstance(value, str):
         whole = _REF_RE.fullmatch(value.strip())
         if whole:
-            return _resolve_ref(whole.group(1), params, outputs)
+            return _resolve_ref(whole.group(1), scopes)
         return _REF_RE.sub(
-            lambda m: str(_resolve_ref(m.group(1), params, outputs)), value
+            lambda m: str(_resolve_ref(m.group(1), scopes)), value
         )
     if isinstance(value, list):
-        return [render(v, params, outputs) for v in value]
+        return [render(v, scopes) for v in value]
     if isinstance(value, dict):
-        return {k: render(v, params, outputs) for k, v in value.items()}
+        return {k: render(v, scopes) for k, v in value.items()}
     return value
+
+
+# --- in-process data steps ---
+
+
+def _get(obj: Any, path: str) -> Any:
+    if path in ("", None):
+        return obj
+    try:
+        return _walk(obj, str(path).split("."))
+    except (ShortcutError, IndexError):
+        return None
+
+
+def _safe(fn):
+    def compare(a, b):
+        try:
+            return bool(fn(a, b))
+        except TypeError:
+            return False
+    return compare
+
+
+_COMPARE = {
+    "==": _safe(operator.eq), "!=": _safe(operator.ne),
+    ">": _safe(operator.gt), ">=": _safe(operator.ge),
+    "<": _safe(operator.lt), "<=": _safe(operator.le),
+    "in": _safe(lambda a, b: a in b),
+    "not_in": _safe(lambda a, b: a not in b),
+    "contains": _safe(lambda a, b: b in a),
+    "exists": lambda a, b: (a is not None) == (True if b is None else bool(b)),
+}
+
+_OP_REQUIRED = {
+    "filter": ("input",),
+    "pick": ("input", "fields"),
+    "join": ("left", "right", "on"),
+    "value": ("value",),
+}
+
+
+def _as_list(value: Any, what: str) -> list:
+    if not isinstance(value, list):
+        raise ShortcutError(f"{what} must be a list, got {type(value).__name__}")
+    return value
+
+
+def _filter(spec: dict) -> list:
+    items = _as_list(spec["input"], "filter input")
+    where = spec.get("where") or []
+    if isinstance(where, dict):
+        where = [where]
+    for cond in where:
+        if cond.get("op", "==") not in _COMPARE:
+            raise ShortcutError(
+                f"unknown filter op '{cond.get('op')}'; use one of "
+                + ", ".join(_COMPARE)
+            )
+    out = [
+        item for item in items
+        if all(
+            _COMPARE[c.get("op", "==")](_get(item, c.get("field")), c.get("value"))
+            for c in where
+        )
+    ]
+    if spec.get("sort_by") is not None:
+        key = spec["sort_by"]
+        present = [i for i in out if _get(i, key) is not None]
+        missing = [i for i in out if _get(i, key) is None]
+        try:
+            present.sort(key=lambda i: _get(i, key),
+                         reverse=bool(spec.get("descending")))
+        except TypeError as e:
+            raise ShortcutError(f"cannot sort by '{key}': {e}") from e
+        out = present + missing
+    if spec.get("limit") is not None:
+        out = out[: int(spec["limit"])]
+    return out
+
+
+def _pick(spec: dict) -> Any:
+    fields = spec["fields"]
+    if isinstance(fields, list):
+        fields = {f.split(".")[-1]: f for f in fields}
+    if not isinstance(fields, dict):
+        raise ShortcutError("pick fields must be a list or an object")
+
+    def one(item):
+        return {name: _get(item, path) for name, path in fields.items()}
+
+    value = spec["input"]
+    return [one(i) for i in value] if isinstance(value, list) else one(value)
+
+
+def _key(value: Any) -> Any:
+    return str(value) if isinstance(value, (int, float)) else value
+
+
+def _join(spec: dict) -> list:
+    left = _as_list(spec["left"], "join left")
+    right = _as_list(spec["right"], "join right")
+    on = spec["on"]
+    lk, rk = (on.get("left"), on.get("right")) if isinstance(on, dict) else (on, on)
+    name = spec.get("as") or "joined"
+    how = spec.get("how") or "left"
+    if how not in ("left", "inner"):
+        raise ShortcutError("join how must be 'left' or 'inner'")
+    out = []
+    for item in left:
+        key = _key(_get(item, lk))
+        matches = [r for r in right if key is not None and _key(_get(r, rk)) == key]
+        if how == "inner" and not matches:
+            continue
+        joined = matches if spec.get("many") else (matches[0] if matches else None)
+        out.append({**item, name: joined} if isinstance(item, dict)
+                   else {"value": item, name: joined})
+    return out
+
+
+_OPS = {
+    "filter": _filter,
+    "pick": _pick,
+    "join": _join,
+    "value": lambda spec: spec["value"],
+}
 
 
 class Shortcuts:
@@ -168,16 +310,10 @@ class Shortcuts:
         seen: set[str] = set()
         clean = []
         for i, step in enumerate(steps):
-            if not isinstance(step, dict) or not isinstance(step.get("tool"), str):
-                raise ShortcutError(f"step {i}: needs a 'tool' name")
-            tool = step["tool"]
-            if tool in _SELF_TOOLS:
-                raise ShortcutError(f"step {i}: shortcuts cannot call {tool}")
-            if not self._tool(tool):
-                raise ShortcutError(f"step {i}: unknown tool '{tool}'")
-            args = step.get("args") or {}
-            if not isinstance(args, dict):
-                raise ShortcutError(f"step {i}: 'args' must be an object")
+            if not isinstance(step, dict) or ("tool" in step) == ("op" in step):
+                raise ShortcutError(
+                    f"step {i}: needs either a 'tool' or an 'op'"
+                )
             step_id = str(i)
             if step.get("id") is not None:
                 step_id = str(step["id"])
@@ -188,22 +324,59 @@ class Shortcuts:
                     )
             if step_id in seen:
                 raise ShortcutError(f"step {i}: duplicate id '{step_id}'")
-            for ref in _refs(args):
-                head, *path = ref.split(".")
-                if head == "params" and path and path[0] in params:
-                    continue
-                if head == "steps" and path and path[0] in seen:
-                    continue
-                raise ShortcutError(
-                    f"step {i}: reference '{{{{{ref}}}}}' must name a declared "
-                    "parameter or an earlier step"
-                )
+
+            if "tool" in step:
+                tool = step["tool"]
+                if not isinstance(tool, str) or not self._tool(tool):
+                    raise ShortcutError(f"step {i}: unknown tool '{tool}'")
+                if tool in _SELF_TOOLS:
+                    raise ShortcutError(f"step {i}: shortcuts cannot call {tool}")
+                args = step.get("args") or {}
+                if not isinstance(args, dict):
+                    raise ShortcutError(f"step {i}: 'args' must be an object")
+                item = {"id": step_id, "tool": tool, "args": args}
+                checks = [(args, "foreach" in step)]
+                if "foreach" in step:
+                    item["foreach"] = step["foreach"]
+                    checks.append((step["foreach"], False))
+            else:
+                op = step["op"]
+                if op not in _OPS:
+                    raise ShortcutError(
+                        f"step {i}: unknown op '{op}'; use one of "
+                        + ", ".join(_OPS)
+                    )
+                missing = [k for k in _OP_REQUIRED[op] if k not in step]
+                if missing:
+                    raise ShortcutError(
+                        f"step {i}: op '{op}' needs {', '.join(missing)}"
+                    )
+                item = {"id": step_id, **{k: v for k, v in step.items()
+                                          if k != "id"}}
+                checks = [({k: v for k, v in step.items()
+                            if k not in ("id", "op")}, False)]
+
+            for value, item_ok in checks:
+                for ref in _refs(value):
+                    head, *path = ref.split(".")
+                    if head == "params" and path and path[0] in params:
+                        continue
+                    if head == "steps" and path and path[0] in seen:
+                        continue
+                    if head == "item" and item_ok:
+                        continue
+                    raise ShortcutError(
+                        f"step {i}: reference '{{{{{ref}}}}}' must name a "
+                        "declared parameter or an earlier step"
+                        + ("" if item_ok else
+                           " ({{item...}} only works in a foreach step's args)")
+                    )
             seen.update({step_id, str(i)})
-            clean.append({"id": step_id, "tool": tool, "args": args})
+            clean.append(item)
         return clean
 
     def _summary(self, item: dict) -> dict:
-        tools = [s["tool"] for s in item["steps"]]
+        tools = [s["tool"] for s in item["steps"] if "tool" in s]
         return {
             **item,
             "requires_confirm": any(self._is_guarded(t) for t in tools),
@@ -254,7 +427,10 @@ class Shortcuts:
         item = self.storage.get(self.get_user_id(), "shortcut", name)
         if not item:
             raise ShortcutError(f"no shortcut named '{name}'")
-        guarded = sorted({s["tool"] for s in item["steps"] if self._is_guarded(s["tool"])})
+        guarded = sorted({
+            s["tool"] for s in item["steps"]
+            if "tool" in s and self._is_guarded(s["tool"])
+        })
         if guarded and not confirm:
             return {
                 "ran": False,
@@ -273,23 +449,43 @@ class Shortcuts:
 
         context = self.mcp.get_context()
         outputs: dict[str, Any] = {}
+        scopes = {"params": values, "steps": outputs}
         log = []
         for i, step in enumerate(item["steps"]):
+            name_ = step.get("tool") or f"op:{step['op']}"
             try:
-                args = render(step["args"], values, outputs)
-                result = await self.mcp._tool_manager.call_tool(
-                    step["tool"], args, context=context
-                )
+                result = await self._run_step(step, scopes, context)
             except Exception as e:
-                log.append({"step": i, "tool": step["tool"], "error": str(e)})
+                log.append({"step": i, "tool": name_, "error": str(e)})
                 return {"ran": False, "failed_step": i, "steps": log,
                         "results": outputs if include_all_results else None}
             outputs[step["id"]] = outputs[str(i)] = result
-            log.append({"step": i, "tool": step["tool"], "ok": True})
+            log.append({"step": i, "tool": name_, "ok": True})
         out = {"ran": True, "steps": log, "result": result}
         if include_all_results:
             out["results"] = {s["id"]: outputs[s["id"]] for s in item["steps"]}
         return out
+
+    async def _run_step(self, step: dict, scopes: dict, context) -> Any:
+        if "op" in step:
+            spec = render(
+                {k: v for k, v in step.items() if k not in ("id", "op")}, scopes
+            )
+            return _OPS[step["op"]](spec)
+        call = self.mcp._tool_manager.call_tool
+        if "foreach" not in step:
+            return await call(step["tool"], render(step["args"], scopes),
+                              context=context)
+        items = _as_list(render(step["foreach"], scopes), "foreach")
+        if len(items) > MAX_FOREACH:
+            raise ShortcutError(
+                f"foreach has {len(items)} items; the limit is {MAX_FOREACH}"
+            )
+        return [
+            await call(step["tool"], render(step["args"], {**scopes, "item": it}),
+                       context=context)
+            for it in items
+        ]
 
     async def save_rule(self, rule: str, rule_id: str | None = None) -> dict:
         rule_id = rule_id or uuid.uuid4().hex[:8]
@@ -314,14 +510,26 @@ class Shortcuts:
         add = self.mcp.add_tool
         add(self.save_shortcut, name="save_shortcut", description=(
             "Save (or overwrite) a named shortcut for the current user: a "
-            "sequence of calls to this server's tools that can be replayed "
-            "with run_shortcut. steps is a list of {\"tool\": name, \"args\": "
-            "{...}, \"id\": optional label}. Args may reference "
-            "{{params.<name>}} (declared in params as name -> description, "
-            "optional defaults) or earlier outputs via "
-            "{{steps.<id|index>.<path>}}; use '*' in a path to map over a "
-            "list, e.g. {{steps.queue.queue.*.employee_id}}. Saving never "
-            "runs the steps."
+            "sequence of steps replayed later with run_shortcut. Saving never "
+            "runs the steps.\n"
+            "Tool step: {\"id\": label, \"tool\": name, \"args\": {...}}; add "
+            "\"foreach\": <list ref> to call the tool once per item, using "
+            "{{item.<path>}} in args.\n"
+            "Data steps (no tool call): "
+            "{\"op\": \"filter\", \"input\": ref, \"where\": [{\"field\": path, "
+            "\"op\": ==|!=|>|>=|<|<=|in|not_in|contains|exists, \"value\": v}], "
+            "\"sort_by\": path, \"descending\": bool, \"limit\": n}; "
+            "{\"op\": \"pick\", \"input\": ref, \"fields\": [paths] or "
+            "{new_name: path}}; "
+            "{\"op\": \"join\", \"left\": ref, \"right\": ref, \"on\": key or "
+            "{\"left\": path, \"right\": path}, \"as\": name, \"how\": "
+            "left|inner, \"many\": bool} (adds the matching right item under "
+            "'as'); {\"op\": \"value\", \"value\": any} (build an object from "
+            "earlier results).\n"
+            "References: {{params.<name>}} (declare in params as name -> "
+            "description; optional defaults) and {{steps.<id|index>.<path>}}; "
+            "path segments are keys, list indexes or '*' to map over a list, "
+            "e.g. {{steps.queue.queue.*.employee_id}}."
         ))
         add(self.list_shortcuts, name="list_shortcuts", description=(
             "List the current user's saved shortcuts with their steps, "

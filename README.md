@@ -56,24 +56,43 @@ Dates are interpreted in the business's local time zone, set by the
 
 ### Shortcuts and rules
 
-Each user can save **shortcuts**: a named list of calls to this server's
-tools that the AI replays with one `run_shortcut` call. Step arguments can
-reference run-time parameters (`{{params.start}}`) and earlier step outputs
-(`{{steps.queue.queue.*.employee_id}}`; `*` maps over a list). **Rules** are
-standing instructions (e.g. "always flag shifts over 10h") that the AI is told
-to load with `list_rules` at the start of a session. Both are stored per user
-in DynamoDB with no expiry.
+Each user can save **shortcuts**: a named list of steps that the AI replays
+with one `run_shortcut` call. **Rules** are standing instructions (e.g.
+"always flag shifts over 10h") that the AI is told to load with `list_rules`
+at the start of a session. Both are stored per user in DynamoDB with no
+expiry.
 
-Example `save_shortcut` call:
+A step either calls a tool or transforms earlier results in-process:
+
+| Step | What it does |
+| --- | --- |
+| `{"tool": ..., "args": {...}}` | Call one of this server's tools |
+| `{"tool": ..., "foreach": ref, "args": {...}}` | Call the tool once per item (max 100), using `{{item.<path>}}` in args |
+| `{"op": "filter", "input", "where", "sort_by", "descending", "limit"}` | Keep items matching all `where` conditions (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not_in`, `contains`, `exists`) |
+| `{"op": "pick", "input", "fields"}` | Keep or rename fields (`["a", "b.c"]` or `{"new": "path"}`) |
+| `{"op": "join", "left", "right", "on", "as", "how", "many"}` | Attach the matching `right` item(s) to each `left` item under `as` (`how`: `left` or `inner`) |
+| `{"op": "value", "value": ...}` | Build the final output from earlier results |
+
+Any value can reference run-time parameters (`{{params.start}}`) and earlier
+step outputs (`{{steps.queue.queue.*.employee_id}}`; path segments are keys,
+list indexes or `*` to map over a list). A value that is exactly one
+reference keeps its type.
+
+Example `save_shortcut` call that flags employees with many pending sheets:
 
 ```json
 {
-  "name": "flag-long-shifts",
-  "description": "Flag everyone in the queue for review",
-  "params": {"start": "first day of the pay period, YYYY-MM-DD"},
+  "name": "flag-busy-employees",
+  "description": "Flag employees with more than N pending timesheets",
+  "params": {"start": "first day of the pay period, YYYY-MM-DD", "min": "pending count"},
+  "defaults": {"min": 5},
   "steps": [
     {"id": "queue", "tool": "get_approval_queue", "args": {"date_from": "{{params.start}}"}},
-    {"tool": "flag_employee", "args": {"employee_id": "{{steps.queue.queue.0.employee_id}}", "reason": "review"}}
+    {"id": "busy", "op": "filter", "input": "{{steps.queue.queue}}",
+     "where": [{"field": "pending_count", "op": ">", "value": "{{params.min}}"}]},
+    {"id": "flags", "tool": "flag_employee", "foreach": "{{steps.busy}}",
+     "args": {"employee_id": "{{item.employee_id}}", "reason": "{{item.pending_count}} pending sheets"}},
+    {"op": "pick", "input": "{{steps.busy}}", "fields": ["employee_name", "pending_count"]}
   ]
 }
 ```
