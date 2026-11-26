@@ -80,6 +80,27 @@ def _timesheet_properties(ts: dict) -> dict:
     return props
 
 
+def _mealbreak_minutes(ts: dict) -> int:
+    """Minutes of meal break from a v1 Mealbreak value ("...THH:MM:SS...")."""
+    raw = str(ts.get("Mealbreak") or "")
+    clock = raw.split("T", 1)[1] if "T" in raw else raw
+    try:
+        hours, minutes = clock.split(":")[:2]
+        return int(hours) * 60 + int(minutes)
+    except ValueError:
+        return 0
+
+
+def _mealbreak_candidates(ts: dict) -> list[str]:
+    # suggest-rounding requires a mealbreak string but its format is
+    # undocumented, so try the plausible encodings in order.
+    mins = _mealbreak_minutes(ts)
+    candidates = [f"{mins // 60:02d}:{mins % 60:02d}", f"PT{mins}M", str(mins)]
+    if ts.get("Mealbreak"):
+        candidates.append(str(ts["Mealbreak"]))
+    return list(dict.fromkeys(candidates))
+
+
 class DeputyClient:
     """Per-user Deputy API client bound to their install endpoint."""
 
@@ -231,10 +252,9 @@ class DeputyClient:
     async def timesheet_questions(
         self, timesheet_id: int, timesheet: dict | None = None
     ) -> dict:
-        ts = timesheet or await self.get_timesheet(timesheet_id)
-        body = await self._current_properties_body(timesheet_id, ts)
-        if ts.get("Employee"):
-            body["setProperties"]["employeeId"] = int(ts["Employee"])
+        # Including employeeId makes Deputy treat this as an edit and
+        # return 403 "cannot update employee".
+        body = await self._current_properties_body(timesheet_id, timesheet)
         return await self._request(
             "POST",
             f"/api/tsa/v2/timesheets/{timesheet_id}:get-timesheet-questions",
@@ -244,12 +264,23 @@ class DeputyClient:
     async def suggest_rounding(
         self, timesheet_id: int, timesheet: dict | None = None
     ) -> dict:
-        body = await self._current_properties_body(timesheet_id, timesheet)
-        return await self._request(
-            "POST",
-            f"/api/tsa/v2/timesheets/{timesheet_id}:suggest-rounding",
-            body["setProperties"],
-        )
+        ts = timesheet or await self.get_timesheet(timesheet_id)
+        body = (await self._current_properties_body(timesheet_id, ts))[
+            "setProperties"
+        ]
+        error: DeputyError | None = None
+        for mealbreak in _mealbreak_candidates(ts):
+            try:
+                return await self._request(
+                    "POST",
+                    f"/api/tsa/v2/timesheets/{timesheet_id}:suggest-rounding",
+                    {**body, "mealbreak": mealbreak},
+                )
+            except DeputyError as e:
+                if "mealbreak" not in str(e).lower():
+                    raise
+                error = e
+        raise error
 
     async def approve(
         self,
