@@ -82,6 +82,12 @@ class ShortcutError(ValueError):
     pass
 
 
+class _PartialForeach(ShortcutError):
+    def __init__(self, message: str, completed: list):
+        super().__init__(message)
+        self.completed = completed
+
+
 def _refs(value: Any) -> list[str]:
     if isinstance(value, str):
         return _REF_RE.findall(value)
@@ -474,7 +480,10 @@ class Shortcuts:
             try:
                 result = await self._run_step(step, scopes, context)
             except Exception as e:
-                log.append({"step": i, "tool": name_, "error": str(e)})
+                entry = {"step": i, "tool": name_, "error": str(e)}
+                if isinstance(e, _PartialForeach):
+                    entry["completed_items"] = e.completed
+                log.append(entry)
                 return {"ran": False, "failed_step": i, "steps": log,
                         "results": outputs if include_all_results else None}
             outputs[step["id"]] = outputs[str(i)] = result
@@ -499,11 +508,18 @@ class Shortcuts:
             raise ShortcutError(
                 f"foreach has {len(items)} items; the limit is {MAX_FOREACH}"
             )
-        return [
-            await call(step["tool"], render(step["args"], {**scopes, "item": it}),
-                       context=context)
-            for it in items
-        ]
+        results = []
+        for n, it in enumerate(items):
+            try:
+                results.append(await call(
+                    step["tool"], render(step["args"], {**scopes, "item": it}),
+                    context=context,
+                ))
+            except Exception as e:
+                raise _PartialForeach(
+                    f"item {n} failed after {n} succeeded: {e}", results
+                ) from e
+        return results
 
     async def save_rule(self, rule: str, rule_id: str | None = None) -> dict:
         rule_id = rule_id or uuid.uuid4().hex[:8]
