@@ -113,14 +113,18 @@ def get_employee_profiles(user_id: str, employee_ids: list[int]) -> dict[int, di
     keys = [
         {"pk": f"USER#{user_id}", "sk": f"EMP#{eid}"} for eid in employee_ids
     ]
-    resp = _t().meta.client.batch_get_item(
-        RequestItems={
-            config.TABLE_NAME: {"Keys": keys, "ConsistentRead": True}
-        }
-    )
     out = {}
-    for item in resp.get("Responses", {}).get(config.TABLE_NAME, []):
-        out[int(item["employee_id"])] = _public(item)
+    # BatchGetItem accepts at most 100 keys per request.
+    for i in range(0, len(keys), 100):
+        resp = _t().meta.client.batch_get_item(
+            RequestItems={
+                config.TABLE_NAME: {
+                    "Keys": keys[i:i + 100], "ConsistentRead": True
+                }
+            }
+        )
+        for item in resp.get("Responses", {}).get(config.TABLE_NAME, []):
+            out[int(item["employee_id"])] = _public(item)
     return out
 
 
