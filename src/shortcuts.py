@@ -222,7 +222,14 @@ def _filter(spec: dict) -> list:
 def _pick(spec: dict) -> Any:
     fields = spec["fields"]
     if isinstance(fields, list):
-        fields = {f.split(".")[-1]: f for f in fields}
+        names = [f.split(".")[-1] for f in fields]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ShortcutError(
+                f"pick fields share the name {', '.join(dupes)}; use the "
+                "object form {new_name: path} to rename them"
+            )
+        fields = dict(zip(names, fields))
     if not isinstance(fields, dict):
         raise ShortcutError("pick fields must be a list or an object")
 
