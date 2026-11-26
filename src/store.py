@@ -1,5 +1,6 @@
 import json
 import time
+import uuid
 from decimal import Decimal
 from typing import Any
 
@@ -203,7 +204,10 @@ def record_approval_event(
     _put(
         {
             "pk": f"USER#{user_id}",
-            "sk": f"HIST#{employee_id}#{int(time.time())}#{timesheet_id}",
+            "sk": (
+                f"HIST#{employee_id}#{int(time.time())}#{timesheet_id}"
+                f"#{uuid.uuid4().hex[:8]}"
+            ),
             "employee_id": employee_id,
             "timesheet_id": timesheet_id,
             "action": action,
