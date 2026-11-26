@@ -332,8 +332,8 @@ async def list_timesheets(
         since = _parse_since(modified_since)
         sheets = [
             t for t in sheets
-            if t.get("Modified")
-            and datetime.fromisoformat(t["Modified"]) >= since
+            if (stamp := t.get("Modified") or t.get("Created"))
+            and datetime.fromisoformat(stamp) >= since
         ]
     limit = max(1, min(limit, _QUERY_MAX))
     return {

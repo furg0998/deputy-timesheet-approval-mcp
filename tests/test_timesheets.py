@@ -143,6 +143,9 @@ def test_list_filters(client):
     assert _ids(_list(exported=False)) == [1, 3]
     assert _ids(_list(modified_since="2026-11-26")) == [1, 3]
     assert _ids(_list(modified_since="2026-11-25T09:00:00+11:00")) == [1, 2, 3]
+    client.sheets.append(_ts(5, Modified=None, Created="2026-11-26T10:00:00+11:00"))
+    assert _ids(_list(modified_since="2026-11-26")) == [1, 3, 5]
+    client.sheets.pop()
     assert client.calls[0]["discarded"] is False
     _list(include_discarded=True)
     assert client.calls[-1]["discarded"] is None
