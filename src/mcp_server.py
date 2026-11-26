@@ -93,32 +93,124 @@ async def _record(user: dict, ts_id: int, action: str, timesheet: dict | None):
         )
 
 
+_QUERY_MAX = 500
+_BREAK_TYPES = {"M": "meal", "R": "rest"}
+
+
+def _breaks(ts: dict) -> list[dict]:
+    """Breaks from the timesheet's Slots; falls back to the Mealbreak
+    duration for records without slot detail."""
+    out = []
+    for slot in ts.get("Slots") or []:
+        if slot.get("strType") != "B" or slot.get("blnEmptySlot"):
+            continue
+        kind = (slot.get("mixedActivity") or {}).get("strBreakType")
+        secs = int(slot.get("intEnd") or 0) - int(slot.get("intStart") or 0)
+        out.append(
+            {
+                "type": _BREAK_TYPES.get(kind, kind or "unknown"),
+                "minutes": max(secs, 0) // 60,
+            }
+        )
+    if not out and (mins := deputy._mealbreak_minutes(ts)):
+        out.append({"type": "meal", "minutes": mins})
+    return out
+
+
+def _self_created(ts: dict) -> bool:
+    creator, emp = ts.get("Creator"), ts.get("Employee")
+    return bool(creator) and int(creator) == int(emp or 0)
+
+
+def _summary(t: dict) -> dict:
+    return {
+        "id": t["Id"],
+        "employee_id": t.get("Employee"),
+        "employee_name": _emp_name(t),
+        "date": t.get("Date"),
+        "start": t.get("StartTimeLocalized"),
+        "end": t.get("EndTimeLocalized"),
+        "hours": t.get("TotalTime"),
+        "cost": t.get("Cost"),
+        "breaks": _breaks(t),
+        "time_approved": t.get("TimeApproved"),
+        "pay_approved": t.get("PayRuleApproved"),
+        "exported": t.get("Exported"),
+        "pay_staged": t.get("PayStaged"),
+        "pay_cycle_id": t.get("PaycycleId"),
+        "discarded": t.get("Discarded"),
+        "disputed": t.get("Disputed"),
+        "in_progress": t.get("IsInProgress"),
+        "is_leave": t.get("IsLeave"),
+        "roster_id": t.get("Roster"),
+        "self_created": _self_created(t),
+        "created": t.get("Created"),
+        "modified": t.get("Modified"),
+        "employee_comment": t.get("EmployeeComment"),
+    }
+
+
+def _timesheet_anomalies(ts: dict) -> list[str]:
+    out: list[str] = []
+    total = ts.get("TotalTime") or 0
+    in_progress = ts.get("IsInProgress")
+    leave = ts.get("IsLeave")
+    if not in_progress and (
+        not total or not ts.get("StartTime") or not ts.get("EndTime")
+    ):
+        out.append("empty: no hours or missing start/end time")
+    if total > 10:
+        out.append(f"long shift: {total:.1f}h")
+    if ts.get("Disputed"):
+        out.append("marked as disputed")
+    breaks = _breaks(ts)
+    if total > 5 and not leave and not any(
+        b["type"] == "meal" for b in breaks
+    ):
+        if breaks:
+            out.append(f"{total:.1f}h shift with no meal break (rest break only)")
+        else:
+            out.append(f"{total:.1f}h shift with no break recorded")
+    if total and not ts.get("Cost") and not leave:
+        out.append(
+            "$0 cost (pay rules not yet approved)"
+            if not ts.get("PayRuleApproved")
+            else "$0 cost"
+        )
+    if _self_created(ts) and not ts.get("Roster") and not leave:
+        out.append("created by the employee with no rostered shift")
+    day = str(ts.get("Date") or "")[:10]
+    return [f"timesheet {ts.get('Id')} ({day}): {a}" for a in out]
+
+
 def _anomalies(emp_id: int, timesheets: list[dict], profile: dict,
                history: list[dict]) -> list[str]:
     out: list[str] = []
-    if profile.get("watch") or profile.get("flags"):
-        for f in profile.get("flags", [])[-3:]:
-            out.append(f"flagged: {f.get('reason')} ({f.get('type')})")
+    for f in profile.get("flags", [])[-3:]:
+        out.append(f"flagged: {f.get('reason')} ({f.get('type')})")
+    for ts in timesheets:
+        out.extend(_timesheet_anomalies(ts))
     past_hours = [
         float(h["total_time"]) for h in history if h.get("total_time")
     ]
-    if not past_hours:
-        return out
-    avg = sum(past_hours) / len(past_hours)
-    for ts in timesheets:
-        total = ts.get("TotalTime") or 0
-        if total and avg and abs(total - avg) / max(avg, 0.01) > 0.3:
-            out.append(
-                f"shift {total:.1f}h is >30% off this employee's usual "
-                f"{avg:.1f}h"
-            )
-        if total and total > 10:
-            out.append(f"long shift: {total:.1f}h")
-        if ts.get("Disputed"):
-            out.append("timesheet marked as disputed")
-        if total and total > 5 and not ts.get("MealbreakSlots"):
-            out.append(f"{total:.1f}h shift with no meal break recorded")
+    avg = sum(past_hours) / len(past_hours) if past_hours else 0
+    if avg:
+        for ts in timesheets:
+            total = ts.get("TotalTime") or 0
+            if total and abs(total - avg) / avg > 0.3:
+                out.append(
+                    f"timesheet {ts.get('Id')}: {total:.1f}h is >30% off "
+                    f"this employee's usual {avg:.1f}h"
+                )
     return list(dict.fromkeys(out))
+
+
+def _parse_since(value: str) -> datetime:
+    """YYYY-MM-DD (local midnight) or an ISO datetime."""
+    if len(value) == 10:
+        return datetime.fromtimestamp(_to_unix(value), _tz())
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=_tz())
 
 
 @mcp.tool()
@@ -138,7 +230,7 @@ async def get_approval_queue(
 
     timesheets = await client.query_timesheets(
         _to_unix(df), _to_unix(dt, days=1), time_approved=False,
-        discarded=False,
+        discarded=False, max_results=_QUERY_MAX,
     )
 
     by_emp: dict[int, list[dict]] = {}
@@ -176,15 +268,9 @@ async def get_approval_queue(
                 ),
                 "pending_timesheets": [
                     {
-                        "id": t["Id"],
-                        "date": t.get("Date"),
-                        "start": t.get("StartTimeLocalized"),
-                        "end": t.get("EndTimeLocalized"),
-                        "hours": t.get("TotalTime"),
-                        "cost": t.get("Cost"),
-                        "disputed": t.get("Disputed"),
-                        "in_progress": t.get("IsInProgress"),
-                        "employee_comment": t.get("EmployeeComment"),
+                        k: v
+                        for k, v in _summary(t).items()
+                        if k not in ("employee_id", "employee_name")
                     }
                     for t in sheets
                 ],
@@ -195,6 +281,7 @@ async def get_approval_queue(
         "date_from": df,
         "date_to": dt,
         "employee_count": len(queue),
+        "truncated": len(timesheets) >= _QUERY_MAX,
         "queue": queue,
     }
 
@@ -204,41 +291,72 @@ async def list_timesheets(
     date_from: str,
     date_to: str,
     employee_id: int | None = None,
+    employee_name: str | None = None,
     approved: bool | None = None,
-) -> list[dict]:
-    """Query timesheets directly. Dates YYYY-MM-DD. Optionally filter by
-    employee and approval state (approved=true/false, omit for all)."""
+    exported: bool | None = None,
+    modified_since: str | None = None,
+    include_discarded: bool = False,
+    limit: int = 100,
+) -> dict:
+    """Query timesheets whose shift starts between date_from and date_to
+    (YYYY-MM-DD, inclusive). Optional filters: employee_id, employee_name
+    (case-insensitive partial match), approved (time approval), exported
+    (sent to payroll), modified_since (YYYY-MM-DD or ISO datetime; matches
+    records created or edited since then) and include_discarded (discarded
+    timesheets are hidden by default). Returns at most `limit` rows;
+    `truncated` is true when more matched, so narrow the filters."""
     client = _client()
     sheets = await client.query_timesheets(
         _to_unix(date_from),
         _to_unix(date_to, days=1),
         employee_id=employee_id,
         time_approved=approved,
-        discarded=False,
+        discarded=None if include_discarded else False,
+        max_results=_QUERY_MAX,
     )
-    return [
-        {
-            "id": t["Id"],
-            "employee_id": t["Employee"],
-            "employee_name": _emp_name(t),
-            "date": t.get("Date"),
-            "start": t.get("StartTimeLocalized"),
-            "end": t.get("EndTimeLocalized"),
-            "hours": t.get("TotalTime"),
-            "cost": t.get("Cost"),
-            "time_approved": t.get("TimeApproved"),
-            "pay_approved": t.get("PayRuleApproved"),
-            "disputed": t.get("Disputed"),
-            "employee_comment": t.get("EmployeeComment"),
-        }
-        for t in sheets
-    ]
+    capped = len(sheets) >= _QUERY_MAX
+    if employee_name:
+        needle = employee_name.casefold()
+        sheets = [t for t in sheets if needle in (_emp_name(t) or "").casefold()]
+    if exported is not None:
+        sheets = [t for t in sheets if bool(t.get("Exported")) == exported]
+    if modified_since:
+        since = _parse_since(modified_since)
+        sheets = [
+            t for t in sheets
+            if t.get("Modified")
+            and datetime.fromisoformat(t["Modified"]) >= since
+        ]
+    limit = max(1, min(limit, _QUERY_MAX))
+    return {
+        "count": len(sheets),
+        "truncated": capped or len(sheets) > limit,
+        "timesheets": [_summary(t) for t in sheets[:limit]],
+    }
 
 
 @mcp.tool()
-async def get_timesheet_detail(timesheet_id: int) -> dict:
-    """Full detail for one timesheet: pay-range summary plus any
-    timesheet questions and answers Deputy requires before approval."""
+async def get_timesheets(timesheet_ids: list[int]) -> dict:
+    """Summaries (times, breaks, cost, approval/export state, created and
+    modified times) for up to 100 timesheets in one Deputy call. Prefer this
+    over calling get_timesheet_detail in a loop."""
+    ids = list(dict.fromkeys(int(i) for i in timesheet_ids))
+    if len(ids) > 100:
+        raise ValueError("At most 100 timesheet_ids per call")
+    sheets = await _client().get_timesheets(ids)
+    found = {int(t["Id"]) for t in sheets}
+    return {
+        "count": len(sheets),
+        "timesheets": [_summary(t) for t in sheets],
+        "not_found": [i for i in ids if i not in found],
+    }
+
+
+@mcp.tool()
+async def get_timesheet_detail(timesheet_id: int, full: bool = False) -> dict:
+    """Detail for one timesheet: summary, anomalies, pay-range summary and
+    any timesheet questions Deputy requires before approval. Pass full=true
+    to include the raw Deputy record."""
     client = _client()
     ts = await client.get_timesheet(timesheet_id)
     if not ts:
@@ -249,7 +367,8 @@ async def get_timesheet_detail(timesheet_id: int) -> dict:
     except deputy.DeputyError as e:
         questions = {"error": str(e)}
     return {
-        "timesheet": ts,
+        "timesheet": ts if full else _summary(ts),
+        "anomalies": _timesheet_anomalies(ts),
         "range_summary": summary,
         "questions": questions,
     }

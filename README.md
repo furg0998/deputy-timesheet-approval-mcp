@@ -19,8 +19,10 @@ so the agent learns which approvals look unusual over time.
 - **Memory** - every approve/unapprove/discard action is recorded in
   DynamoDB per employee, alongside notes and flags you set via tools.
   `get_approval_queue` joins pending timesheets with this history and
-  surfaces anomalies (hours far off the employee's norm, long shifts,
-  missing meal breaks, disputed sheets, flagged employees).
+  surfaces anomalies per timesheet (long shifts, missing meal breaks or
+  rest-break-only shifts, empty sheets, $0 cost before pay approval,
+  employee-created sheets with no roster, disputed sheets, flagged
+  employees, and hours far off the employee's norm once history exists).
 
 ## Tools
 
@@ -39,8 +41,9 @@ Dates are interpreted in the business's local time zone, set by the
 | Tool | Purpose |
 | --- | --- |
 | `get_approval_queue` | Pending timesheets grouped by employee, with history/flags/anomalies |
-| `list_timesheets` | Raw timesheet query by date range / employee / approval state |
-| `get_timesheet_detail` | Timesheet + pay-range summary + required questions |
+| `list_timesheets` | Timesheet query by shift date, filterable by employee id/name, approval, export state, modified-since, and optionally including discarded; capped by `limit` with a `truncated` flag |
+| `get_timesheets` | Summaries for up to 100 timesheet IDs in one Deputy call |
+| `get_timesheet_detail` | Timesheet summary + anomalies + pay-range summary + required questions (`full=true` for the raw record) |
 | `suggest_rounding` | Deputy's rounding suggestion |
 | `approve_timesheet` | **Transactional.** Approve time + pay (optional overrides/question answers) |
 | `approve_time_only` | **Transactional.** Approve time only |

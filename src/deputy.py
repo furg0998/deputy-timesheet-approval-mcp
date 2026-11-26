@@ -198,6 +198,22 @@ class DeputyClient:
         items = result if isinstance(result, list) else result.get("data", [])
         return items[0] if items else None
 
+    async def get_timesheets(self, timesheet_ids: list[int]) -> list[dict]:
+        if not timesheet_ids:
+            return []
+        result = await self._request(
+            "POST",
+            "/api/v1/resource/Timesheet/QUERY",
+            {
+                "search": {
+                    "s1": {"field": "Id", "data": timesheet_ids, "type": "in"}
+                },
+                "max": len(timesheet_ids),
+            },
+        )
+        items = result if isinstance(result, list) else result.get("data", [])
+        return items if isinstance(items, list) else []
+
     async def query_employees(self, employee_ids: list[int]) -> list[dict]:
         if not employee_ids:
             return []
