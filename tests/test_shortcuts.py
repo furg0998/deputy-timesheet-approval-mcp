@@ -97,6 +97,8 @@ def test_destructive_steps_need_confirm(env):
     ([{"tool": "get_queue", "args": {"date_from": "{{params.x}}"}}], {}, "declared"),
     ([{"tool": "get_queue", "args": {"date_from": "{{steps.0.a}}"}}], {}, "earlier step"),
     ([], {}, "at least one"),
+    ([{"id": "1", "tool": "get_queue", "args": {"date_from": "x"}},
+      {"tool": "get_queue", "args": {"date_from": "y"}}], {}, "not just a number"),
 ])
 def test_validation(env, steps, params, err):
     _, sc, _, _ = env

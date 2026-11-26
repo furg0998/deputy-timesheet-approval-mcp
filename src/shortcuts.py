@@ -178,7 +178,14 @@ class Shortcuts:
             args = step.get("args") or {}
             if not isinstance(args, dict):
                 raise ShortcutError(f"step {i}: 'args' must be an object")
-            step_id = str(step.get("id") or i)
+            step_id = str(i)
+            if step.get("id") is not None:
+                step_id = str(step["id"])
+                if not _NAME_RE.match(step_id) or step_id.isdigit():
+                    raise ShortcutError(
+                        f"step {i}: id must be lowercase letters, digits, - or "
+                        "_ and not just a number"
+                    )
             if step_id in seen:
                 raise ShortcutError(f"step {i}: duplicate id '{step_id}'")
             for ref in _refs(args):
