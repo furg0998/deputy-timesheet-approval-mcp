@@ -27,6 +27,7 @@ Path segments are dict keys, list indexes, or `*` to map over a list. A value
 that is exactly one reference keeps its type (list, int, ...); references
 inside longer strings are interpolated as text.
 """
+import json
 import operator
 import re
 import time
@@ -44,6 +45,7 @@ INSTRUCTIONS = (
 
 MAX_STEPS = 20
 MAX_FOREACH = 100
+MAX_RESULT_BYTES = 4_000_000
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _REF_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _SELF_TOOLS = {
@@ -479,6 +481,11 @@ class Shortcuts:
             name_ = step.get("tool") or f"op:{step['op']}"
             try:
                 result = await self._run_step(step, scopes, context)
+                size = len(json.dumps(result, default=str))
+                if size > MAX_RESULT_BYTES:
+                    raise ShortcutError(
+                        f"result is {size} bytes; the limit is {MAX_RESULT_BYTES}"
+                    )
             except Exception as e:
                 entry = {"step": i, "tool": name_, "error": str(e)}
                 if isinstance(e, _PartialForeach):
