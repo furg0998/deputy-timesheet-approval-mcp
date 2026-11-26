@@ -241,7 +241,16 @@ def _pick(spec: dict) -> Any:
 
 
 def _key(value: Any) -> Any:
-    return str(value) if isinstance(value, (int, float)) else value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
 
 
 def _join(spec: dict) -> list:
