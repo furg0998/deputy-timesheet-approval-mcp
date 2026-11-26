@@ -323,7 +323,8 @@ async def list_timesheets(
         needle = employee_name.casefold()
         sheets = [
             t for t in sheets
-            if needle in (names.get(int(t["Employee"])) or "").casefold()
+            if needle
+            in (_emp_name(t) or names.get(int(t["Employee"])) or "").casefold()
         ]
     if exported is not None:
         sheets = [t for t in sheets if bool(t.get("Exported")) == exported]
