@@ -317,7 +317,9 @@ class Shortcuts:
             step_id = str(i)
             if step.get("id") is not None:
                 step_id = str(step["id"])
-                if not _NAME_RE.match(step_id) or step_id.isdigit():
+                if not _NAME_RE.match(step_id) or (
+                    step_id.isdigit() and step_id != str(i)
+                ):
                     raise ShortcutError(
                         f"step {i}: id must be lowercase letters, digits, - or "
                         "_ and not just a number"
