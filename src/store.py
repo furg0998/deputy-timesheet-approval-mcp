@@ -26,7 +26,9 @@ def _put(item: dict) -> None:
 
 
 def _get(pk: str, sk: str) -> dict | None:
-    return _t().get_item(Key={"pk": pk, "sk": sk}).get("Item")
+    return _t().get_item(
+        Key={"pk": pk, "sk": sk}, ConsistentRead=True
+    ).get("Item")
 
 
 def _delete(pk: str, sk: str) -> None:
@@ -57,6 +59,7 @@ def _query(pk: str, sk_prefix: str, limit: int = 50, descending: bool = True):
         KeyConditionExpression=Key("pk").eq(pk) & Key("sk").begins_with(sk_prefix),
         Limit=limit,
         ScanIndexForward=not descending,
+        ConsistentRead=True,
     ).get("Items", [])
 
 
@@ -110,7 +113,9 @@ def get_employee_profiles(user_id: str, employee_ids: list[int]) -> dict[int, di
         {"pk": f"USER#{user_id}", "sk": f"EMP#{eid}"} for eid in employee_ids
     ]
     resp = _t().meta.client.batch_get_item(
-        RequestItems={config.TABLE_NAME: {"Keys": keys}}
+        RequestItems={
+            config.TABLE_NAME: {"Keys": keys, "ConsistentRead": True}
+        }
     )
     out = {}
     for item in resp.get("Responses", {}).get(config.TABLE_NAME, []):
