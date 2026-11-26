@@ -51,6 +51,46 @@ Dates are interpreted in the business's local time zone, set by the
 | `save_employee_note` / `flag_employee` / `clear_employee_flags` | Augmentation layer |
 | `get_employee_profile` / `get_approval_history` | Read the memory layer |
 | `check_connection` | Verify Deputy auth + permissions |
+| `save_shortcut` / `list_shortcuts` / `run_shortcut` / `delete_shortcut` | Per-user saved multi-step workflows |
+| `save_rule` / `list_rules` / `delete_rule` | Per-user standing instructions for the AI |
+
+### Shortcuts and rules
+
+Each user can save **shortcuts**: a named list of calls to this server's
+tools that the AI replays with one `run_shortcut` call. Step arguments can
+reference run-time parameters (`{{params.start}}`) and earlier step outputs
+(`{{steps.queue.queue.*.employee_id}}`; `*` maps over a list). **Rules** are
+standing instructions (e.g. "always flag shifts over 10h") that the AI is told
+to load with `list_rules` at the start of a session. Both are stored per user
+in DynamoDB with no expiry.
+
+Example `save_shortcut` call:
+
+```json
+{
+  "name": "flag-long-shifts",
+  "description": "Flag everyone in the queue for review",
+  "params": {"start": "first day of the pay period, YYYY-MM-DD"},
+  "steps": [
+    {"id": "queue", "tool": "get_approval_queue", "args": {"date_from": "{{params.start}}"}},
+    {"tool": "flag_employee", "args": {"employee_id": "{{steps.queue.queue.0.employee_id}}", "reason": "review"}}
+  ]
+}
+```
+
+If a shortcut contains a transactional tool, `run_shortcut` returns
+`requires_confirm` without running anything until it is called with
+`confirm=true`.
+
+The feature lives in `src/shortcuts.py` and has no Deputy or AWS dependency.
+Another FastMCP server can reuse it by passing its own storage backend and a
+function that returns the current user id:
+
+```python
+shortcuts.Shortcuts(mcp, store.ShortcutStorage(), lambda: current_user_id()).register()
+```
+
+Tests: `pip install pytest && pytest tests`.
 
 ## Deploy
 

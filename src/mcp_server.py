@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 import auth
 import config
 import deputy
+import shortcuts
 import store
 
 mcp = FastMCP(
@@ -24,7 +25,7 @@ mcp = FastMCP(
         "connected to a live Deputy account. Tools marked TRANSACTIONAL "
         "change real timesheets and payroll; never call them to test or "
         "explore, and only call them after the user has explicitly asked "
-        "for that specific action."
+        "for that specific action. " + shortcuts.INSTRUCTIONS
     ),
     stateless_http=True,
     json_response=True,
@@ -420,6 +421,11 @@ async def check_connection() -> dict:
         "user": (_user().get("deputy_me") or {}),
         "permissions": perms,
     }
+
+
+shortcuts.Shortcuts(
+    mcp, store.ShortcutStorage(), lambda: _user()["user_id"]
+).register()
 
 
 class _IdempotentLifespan:

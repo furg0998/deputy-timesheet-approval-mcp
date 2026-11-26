@@ -1,3 +1,4 @@
+import json
 import time
 from decimal import Decimal
 from typing import Any
@@ -220,6 +221,44 @@ def get_approval_history(
 ) -> list[dict]:
     prefix = f"HIST#{employee_id}#" if employee_id is not None else "HIST#"
     return [_public(i) for i in _query(f"USER#{user_id}", prefix, limit=limit)]
+
+
+# --- Shortcuts and rules (no TTL; kept until the user deletes them) ---
+
+
+class ShortcutStorage:
+    """DynamoDB backend for shortcuts.Shortcuts. Items are stored as JSON
+    so arbitrary step arguments (floats, nesting) round-trip unchanged."""
+
+    @staticmethod
+    def _sk(kind: str, key: str = "") -> str:
+        return f"{kind.upper()}#{key}"
+
+    def put(self, user_id: str, kind: str, key: str, item: dict) -> None:
+        _t().put_item(
+            Item={
+                "pk": f"USER#{user_id}",
+                "sk": self._sk(kind, key),
+                "data": json.dumps(item),
+            }
+        )
+
+    def get(self, user_id: str, kind: str, key: str) -> dict | None:
+        item = _get(f"USER#{user_id}", self._sk(kind, key))
+        return json.loads(item["data"]) if item else None
+
+    def list(self, user_id: str, kind: str) -> list[dict]:
+        items = _query(
+            f"USER#{user_id}", self._sk(kind), limit=500, descending=False
+        )
+        return [json.loads(i["data"]) for i in items]
+
+    def delete(self, user_id: str, kind: str, key: str) -> bool:
+        resp = _t().delete_item(
+            Key={"pk": f"USER#{user_id}", "sk": self._sk(kind, key)},
+            ReturnValues="ALL_OLD",
+        )
+        return "Attributes" in resp
 
 
 # --- OAuth flow state (short-lived) ---
