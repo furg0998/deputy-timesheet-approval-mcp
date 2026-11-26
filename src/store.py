@@ -1,4 +1,6 @@
+import json
 import time
+import uuid
 from decimal import Decimal
 from typing import Any
 
@@ -25,7 +27,9 @@ def _put(item: dict) -> None:
 
 
 def _get(pk: str, sk: str) -> dict | None:
-    return _t().get_item(Key={"pk": pk, "sk": sk}).get("Item")
+    return _t().get_item(
+        Key={"pk": pk, "sk": sk}, ConsistentRead=True
+    ).get("Item")
 
 
 def _delete(pk: str, sk: str) -> None:
@@ -56,6 +60,7 @@ def _query(pk: str, sk_prefix: str, limit: int = 50, descending: bool = True):
         KeyConditionExpression=Key("pk").eq(pk) & Key("sk").begins_with(sk_prefix),
         Limit=limit,
         ScanIndexForward=not descending,
+        ConsistentRead=True,
     ).get("Items", [])
 
 
@@ -109,7 +114,9 @@ def get_employee_profiles(user_id: str, employee_ids: list[int]) -> dict[int, di
         {"pk": f"USER#{user_id}", "sk": f"EMP#{eid}"} for eid in employee_ids
     ]
     resp = _t().meta.client.batch_get_item(
-        RequestItems={config.TABLE_NAME: {"Keys": keys}}
+        RequestItems={
+            config.TABLE_NAME: {"Keys": keys, "ConsistentRead": True}
+        }
     )
     out = {}
     for item in resp.get("Responses", {}).get(config.TABLE_NAME, []):
@@ -197,7 +204,10 @@ def record_approval_event(
     _put(
         {
             "pk": f"USER#{user_id}",
-            "sk": f"HIST#{employee_id}#{int(time.time())}#{timesheet_id}",
+            "sk": (
+                f"HIST#{employee_id}#{int(time.time())}#{timesheet_id}"
+                f"#{uuid.uuid4().hex[:8]}"
+            ),
             "employee_id": employee_id,
             "timesheet_id": timesheet_id,
             "action": action,
@@ -220,6 +230,44 @@ def get_approval_history(
 ) -> list[dict]:
     prefix = f"HIST#{employee_id}#" if employee_id is not None else "HIST#"
     return [_public(i) for i in _query(f"USER#{user_id}", prefix, limit=limit)]
+
+
+# --- Shortcuts and rules (no TTL; kept until the user deletes them) ---
+
+
+class ShortcutStorage:
+    """DynamoDB backend for shortcuts.Shortcuts. Items are stored as JSON
+    so arbitrary step arguments (floats, nesting) round-trip unchanged."""
+
+    @staticmethod
+    def _sk(kind: str, key: str = "") -> str:
+        return f"{kind.upper()}#{key}"
+
+    def put(self, user_id: str, kind: str, key: str, item: dict) -> None:
+        _t().put_item(
+            Item={
+                "pk": f"USER#{user_id}",
+                "sk": self._sk(kind, key),
+                "data": json.dumps(item),
+            }
+        )
+
+    def get(self, user_id: str, kind: str, key: str) -> dict | None:
+        item = _get(f"USER#{user_id}", self._sk(kind, key))
+        return json.loads(item["data"]) if item else None
+
+    def list(self, user_id: str, kind: str) -> list[dict]:
+        items = _query(
+            f"USER#{user_id}", self._sk(kind), limit=500, descending=False
+        )
+        return [json.loads(i["data"]) for i in items]
+
+    def delete(self, user_id: str, kind: str, key: str) -> bool:
+        resp = _t().delete_item(
+            Key={"pk": f"USER#{user_id}", "sk": self._sk(kind, key)},
+            ReturnValues="ALL_OLD",
+        )
+        return "Attributes" in resp
 
 
 # --- OAuth flow state (short-lived) ---
