@@ -207,3 +207,38 @@ def test_foreach_destructive_needs_confirm_and_limit(env):
         {"tool": "get_queue", "foreach": "{{params.xs}}", "args": {"date_from": "x"}}]))
     out = run(sc.run_shortcut("big", {"xs": list(range(101))}))
     assert not out["ran"] and "limit" in out["steps"][0]["error"]
+
+
+def test_review_fixes(env):
+    mcp, sc, calls, _ = env
+    saved = run(sc.save_shortcut("s", "d", steps=[
+        {"tool": "get_queue", "args": {"date_from": "x"}},
+        {"tool": "get_queue", "args": {"date_from": "y"}}]))
+    run(sc.save_shortcut("s", "new description", steps=saved["shortcut"]["steps"]))
+
+    with pytest.raises(shortcuts.ShortcutError, match="share the name"):
+        shortcuts._pick({"input": {}, "fields": ["hours", "prior.hours"]})
+
+    joined = shortcuts._join({"left": [{"k": 8}], "right": [{"k": 8.0, "v": 1}, {"k": "8", "v": 2}],
+                              "on": "k", "how": "inner", "many": True})
+    assert [r["v"] for r in joined[0]["joined"]] == [1, 2]
+
+    @mcp.tool()
+    async def maybe_fail(n: int) -> int:
+        if n == 2:
+            raise RuntimeError("boom")
+        return n
+
+    run(sc.save_shortcut("f", "d", params={"ns": ""}, steps=[
+        {"tool": "maybe_fail", "foreach": "{{params.ns}}", "args": {"n": "{{item}}"}}]))
+    out = run(sc.run_shortcut("f", {"ns": [0, 1, 2, 3]}))
+    assert not out["ran"] and out["steps"][0]["completed_items"] == [0, 1]
+
+    steps = [{"id": "a", "op": "value", "value": "x" * 1000}]
+    prev = "a"
+    for n in range(12):
+        steps.append({"id": f"b{n}", "op": "value", "value": [f"{{{{steps.{prev}}}}}"] * 2})
+        prev = f"b{n}"
+    run(sc.save_shortcut("bomb", "d", steps=steps))
+    out = run(sc.run_shortcut("bomb"))
+    assert not out["ran"] and "limit" in out["steps"][-1]["error"]
