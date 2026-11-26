@@ -107,6 +107,10 @@ class FakeClient:
         self.calls.append(kw)
         return self.sheets
 
+    async def query_employees(self, ids):
+        self.calls.append({"employees": ids})
+        return [{"Id": i, "DisplayName": "Helen Cahill"} for i in ids]
+
     async def get_timesheets(self, ids):
         return [t for t in self.sheets if t["Id"] in ids]
 
@@ -142,6 +146,12 @@ def test_list_filters(client):
     assert client.calls[0]["discarded"] is False
     _list(include_discarded=True)
     assert client.calls[-1]["discarded"] is None
+
+
+def test_name_filter_resolves_missing_names(client):
+    client.sheets.append(_ts(4, Employee=21, _DPMetaData={}))
+    assert _ids(_list(employee_name="helen")) == [1, 2, 4]
+    assert client.calls[-1] == {"employees": [21]}
 
 
 def test_list_limit_reports_truncation(client):

@@ -316,8 +316,15 @@ async def list_timesheets(
     )
     capped = len(sheets) >= _QUERY_MAX
     if employee_name:
+        names = {int(t["Employee"]): _emp_name(t) for t in sheets if _emp_name(t)}
+        missing = {int(t["Employee"]) for t in sheets} - set(names)
+        for emp in await client.query_employees(sorted(missing)):
+            names[int(emp["Id"])] = emp.get("DisplayName")
         needle = employee_name.casefold()
-        sheets = [t for t in sheets if needle in (_emp_name(t) or "").casefold()]
+        sheets = [
+            t for t in sheets
+            if needle in (names.get(int(t["Employee"])) or "").casefold()
+        ]
     if exported is not None:
         sheets = [t for t in sheets if bool(t.get("Exported")) == exported]
     if modified_since:
